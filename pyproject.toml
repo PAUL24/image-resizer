@@ -1,32 +1,33 @@
 [build-system]
-  requires = ["hatchling>=1.26"]
-  build-backend = "hatchling.build"
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
 
-  [project]
-  name = "b02-image-resizer"
-  version = "1.0.0"
-  description = "Safe aspect-preserving JPEG and PNG thumbnail generation."
-  readme = "README.md"
-  requires-python = ">=3.12"
-  dependencies = [
-    "pillow>=11.0",
-"python-multipart>=0.0.12",
-  ]
+[project]
+name = "b02-image-resizer"
+version = "1.1.0"
+description = "Safe aspect-preserving JPEG, PNG, WebP, and AVIF thumbnail generation with HEIC/HEIF input support."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pillow>=12.3,<13",
+  "pillow-heif>=1.6,<2",
+  "python-multipart>=0.0.12",
+]
 
-  [project.optional-dependencies]
-  dev = ["pytest>=8.3", "httpx>=0.27", "ruff>=0.8"]
+[project.optional-dependencies]
+dev = ["pytest>=8.3", "httpx>=0.27", "ruff>=0.8"]
 
-  [tool.hatch.build.targets.wheel]
-  packages = ["src/app"]
+[tool.hatch.build.targets.wheel]
+packages = ["src/app"]
 
-  [tool.pytest.ini_options]
-  pythonpath = ["src"]
-  testpaths = ["tests"]
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
 
-  [tool.ruff]
-  line-length = 120
-  target-version = "py312"
+[tool.ruff]
+line-length = 120
+target-version = "py312"
 
-  [tool.ruff.lint]
-  select = ["E", "F", "I"]
-  ignore = ["E501", "E701", "E702", "E741"]
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501", "E701", "E702", "E741"]

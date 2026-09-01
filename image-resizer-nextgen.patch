@@ -1,0 +1,330 @@
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,32 +1,33 @@
+ [build-system]
+-  requires = ["hatchling>=1.26"]
+-  build-backend = "hatchling.build"
++requires = ["hatchling>=1.26"]
++build-backend = "hatchling.build"
+ 
+-  [project]
+-  name = "b02-image-resizer"
+-  version = "1.0.0"
+-  description = "Safe aspect-preserving JPEG and PNG thumbnail generation."
+-  readme = "README.md"
+-  requires-python = ">=3.12"
+-  dependencies = [
+-    "pillow>=11.0",
+-"python-multipart>=0.0.12",
+-  ]
++[project]
++name = "b02-image-resizer"
++version = "1.1.0"
++description = "Safe aspect-preserving JPEG, PNG, WebP, and AVIF thumbnail generation with HEIC/HEIF input support."
++readme = "README.md"
++requires-python = ">=3.12"
++dependencies = [
++  "pillow>=12.3,<13",
++  "pillow-heif>=1.6,<2",
++  "python-multipart>=0.0.12",
++]
+ 
+-  [project.optional-dependencies]
+-  dev = ["pytest>=8.3", "httpx>=0.27", "ruff>=0.8"]
++[project.optional-dependencies]
++dev = ["pytest>=8.3", "httpx>=0.27", "ruff>=0.8"]
+ 
+-  [tool.hatch.build.targets.wheel]
+-  packages = ["src/app"]
++[tool.hatch.build.targets.wheel]
++packages = ["src/app"]
+ 
+-  [tool.pytest.ini_options]
+-  pythonpath = ["src"]
+-  testpaths = ["tests"]
++[tool.pytest.ini_options]
++pythonpath = ["src"]
++testpaths = ["tests"]
+ 
+-  [tool.ruff]
+-  line-length = 120
+-  target-version = "py312"
++[tool.ruff]
++line-length = 120
++target-version = "py312"
+ 
+-  [tool.ruff.lint]
+-  select = ["E", "F", "I"]
+-  ignore = ["E501", "E701", "E702", "E741"]
++[tool.ruff.lint]
++select = ["E", "F", "I"]
++ignore = ["E501", "E701", "E702", "E741"]
+--- a/src/app/core.py
++++ b/src/app/core.py
+@@ -1,34 +1,126 @@
+ from io import BytesIO
+ 
+-from PIL import Image, UnidentifiedImageError
++from PIL import Image, ImageOps, UnidentifiedImageError, features
++from pillow_heif import register_heif_opener
+ 
+ MAX_PIXELS = 25_000_000
++MAX_DIMENSION = 4096
++SUPPORTED_OUTPUTS = {"PNG", "JPEG", "WEBP", "AVIF"}
++OUTPUT_ALIASES = {"JPG": "JPEG"}
++
++# Register HEIC/HEIF as Pillow-readable formats. We only need the primary image,
++# so decoding embedded thumbnails is unnecessary work for this service.
++register_heif_opener(thumbnails=False)
+ 
+ 
+-def resize(data, width, height, output="PNG"):
+-    if width < 1 or height < 1 or width > 4096 or height > 4096:
+-        raise ValueError("dimensions out of range")
++class ImageResizerError(ValueError):
++    """Raised when an uploaded image cannot be safely processed."""
++
++
++def _normalize_output(output: str) -> str:
++    normalized = OUTPUT_ALIASES.get(output.upper(), output.upper())
++    if normalized not in SUPPORTED_OUTPUTS:
++        raise ImageResizerError("output must be PNG, JPEG, WEBP, or AVIF")
++    return normalized
++
++
++def _validate_dimensions(width: int, height: int) -> None:
++    if width < 1 or height < 1 or width > MAX_DIMENSION or height > MAX_DIMENSION:
++        raise ImageResizerError("dimensions out of range")
++
++
++def _validate_quality(quality: int | None) -> None:
++    if quality is not None and not 0 <= quality <= 100:
++        raise ImageResizerError("quality must be between 0 and 100")
++
++
++def _check_pixel_limit(image: Image.Image) -> None:
++    if image.width * image.height > MAX_PIXELS:
++        raise ImageResizerError("image pixel limit exceeded")
++
++
++def _open_image(data: bytes) -> Image.Image:
++    if not data:
++        raise ImageResizerError("image data is empty")
++
+     try:
+-        image = Image.open(BytesIO(data))
+-        image.verify()
+-        image = Image.open(BytesIO(data))
+-    except UnidentifiedImageError as exc:
+-        raise ValueError("invalid image") from exc
+-    if image.width * image.height > MAX_PIXELS:
+-        raise ValueError("image pixel limit exceeded")
+-    image.thumbnail((width, height))
++        # Verify the file structure first, then reopen because verify() invalidates
++        # the decoder state for subsequent image operations.
++        with Image.open(BytesIO(data)) as probe:
++            _check_pixel_limit(probe)
++            probe.verify()
++
++        with Image.open(BytesIO(data)) as source:
++            _check_pixel_limit(source)
++            source.load()
++            image = ImageOps.exif_transpose(source).copy()
++    except ImageResizerError:
++        raise
++    except Image.DecompressionBombError as exc:
++        raise ImageResizerError("image pixel limit exceeded") from exc
++    except (UnidentifiedImageError, OSError, EOFError, SyntaxError, RuntimeError, ValueError) as exc:
++        raise ImageResizerError("invalid or unsupported image") from exc
++
++    return image
++
++
++def _ensure_encoder_available(output: str) -> None:
++    feature = {"WEBP": "webp", "AVIF": "avif"}.get(output)
++    if feature and not features.check(feature):
++        raise ImageResizerError(f"{output} encoding is not available in this Pillow build")
++
++
++def _rgb_or_rgba(image: Image.Image) -> Image.Image:
++    has_alpha = "A" in image.getbands() or "transparency" in image.info
++    return image.convert("RGBA" if has_alpha else "RGB")
++
++
++def resize(data: bytes, width: int, height: int, output: str = "PNG", quality: int | None = None):
++    _validate_dimensions(width, height)
++    _validate_quality(quality)
++
++    output = _normalize_output(output)
++    _ensure_encoder_available(output)
++
++    image = _open_image(data)
++    image.thumbnail((width, height), Image.Resampling.LANCZOS)
++
+     out = BytesIO()
+-    if output.upper() == "JPEG":
+-        image.convert("RGB").save(out, "JPEG", quality=85)
+-    elif output.upper() == "PNG":
+-        image.save(out, "PNG")
+-    else:
+-        raise ValueError("output must be PNG or JPEG")
++    try:
++        if output == "JPEG":
++            _rgb_or_rgba(image).convert("RGB").save(
++                out, "JPEG", quality=85 if quality is None else quality, optimize=True
++            )
++        elif output == "PNG":
++            image.save(out, "PNG", optimize=True)
++        elif output == "WEBP":
++            _rgb_or_rgba(image).save(
++                out, "WEBP", quality=80 if quality is None else quality, method=4
++            )
++        elif output == "AVIF":
++            # Pillow's AVIF writer accepts 8-bit RGB/RGBA images.
++            _rgb_or_rgba(image).save(
++                out, "AVIF", quality=75 if quality is None else quality, speed=6
++            )
++    except (OSError, ValueError) as exc:
++        raise ImageResizerError(f"failed to encode {output}") from exc
++
+     return out.getvalue(), image.size
+ 
+ 
+-def process_upload(data, filename, content_type):
+-    return resize(data, 256, 256, "JPEG" if content_type == "image/jpeg" else "PNG")[0]
++def process_upload(
++    data: bytes,
++    filename: str,
++    content_type: str,
++    output: str | None = None,
++    width: int = 256,
++    height: int = 256,
++    quality: int | None = None,
++):
++    # Do not trust filename/content_type to decode the file; Pillow sniffs the bytes.
++    # content_type is used only to preserve the previous default output behavior.
++    default_output = "JPEG" if content_type.lower() == "image/jpeg" else "PNG"
++    return resize(data, width, height, output or default_output, quality)[0]
+ 
+ 
+ def process(payload):
+--- a/src/app/__main__.py
++++ b/src/app/__main__.py
+@@ -1,14 +1,43 @@
+ import argparse
+-import json
++from pathlib import Path
+ 
+-from .core import process
++from .core import ImageResizerError, resize
++
++EXTENSION_TO_FORMAT = {
++    ".png": "PNG",
++    ".jpg": "JPEG",
++    ".jpeg": "JPEG",
++    ".webp": "WEBP",
++    ".avif": "AVIF",
++}
+ 
+ 
+ def main():
+-    parser = argparse.ArgumentParser(description="Safe aspect-preserving JPEG and PNG thumbnail generation.")
+-    parser.add_argument("payload", nargs="?", default="{}", help="JSON input")
++    parser = argparse.ArgumentParser(
++        description="Resize JPEG, PNG, WebP, AVIF, HEIC, or HEIF images while preserving aspect ratio."
++    )
++    parser.add_argument("input", type=Path, help="Source image, including .heic/.heif")
++    parser.add_argument("output", type=Path, help="Destination .png/.jpg/.webp/.avif file")
++    parser.add_argument("--width", type=int, default=256, help="Maximum output width (default: 256)")
++    parser.add_argument("--height", type=int, default=256, help="Maximum output height (default: 256)")
++    parser.add_argument("--format", choices=["png", "jpeg", "jpg", "webp", "avif"], help="Override output format")
++    parser.add_argument("--quality", type=int, help="JPEG/WebP/AVIF quality, 0-100")
+     args = parser.parse_args()
+-    print(json.dumps(process(json.loads(args.payload)), indent=2, default=str))
++
++    output_format = args.format.upper() if args.format else EXTENSION_TO_FORMAT.get(args.output.suffix.lower())
++    if output_format == "JPG":
++        output_format = "JPEG"
++    if output_format is None:
++        parser.error("cannot infer output format; use .png/.jpg/.webp/.avif or --format")
++
++    try:
++        data = args.input.read_bytes()
++        resized, size = resize(data, args.width, args.height, output_format, args.quality)
++        args.output.write_bytes(resized)
++    except (ImageResizerError, OSError) as exc:
++        parser.error(str(exc))
++
++    print(f"Wrote {args.output} ({size[0]}x{size[1]}, {output_format})")
+ 
+ 
+ if __name__ == "__main__":
+--- a/tests/test_core.py
++++ b/tests/test_core.py
+@@ -1,14 +1,20 @@
+ from io import BytesIO
+ 
+ import pytest
+-from PIL import Image
++from PIL import Image, features
+ 
+-from app.core import resize
++from app.core import ImageResizerError, resize
+ 
+ 
+ def sample():
+     out = BytesIO()
+     Image.new("RGB", (200, 100), "red").save(out, "PNG")
++    return out.getvalue()
++
++
++def heif_sample():
++    out = BytesIO()
++    Image.new("RGB", (120, 80), "blue").save(out, "HEIF", quality=90)
+     return out.getvalue()
+ 
+ 
+@@ -24,11 +30,41 @@
+     assert resize(sample(), 20, 20, "JPEG")[0].startswith(b"\xff\xd8")
+ 
+ 
++@pytest.mark.skipif(not features.check("webp"), reason="Pillow build has no WebP support")
++def test_webp_output():
++    data = resize(sample(), 20, 20, "WEBP")[0]
++    assert data[:4] == b"RIFF"
++    assert data[8:12] == b"WEBP"
++
++
++@pytest.mark.skipif(not features.check("avif"), reason="Pillow build has no AVIF support")
++def test_avif_output():
++    data = resize(sample(), 20, 20, "AVIF")[0]
++    assert data[4:8] == b"ftyp"
++    assert data[8:12] in {b"avif", b"avis"}
++
++
++def test_heif_input_can_be_resized():
++    data, size = resize(heif_sample(), 60, 60, "PNG")
++    assert data.startswith(b"\x89PNG")
++    assert size == (60, 40)
++
++
+ def test_invalid_bytes():
+-    with pytest.raises(ValueError):
++    with pytest.raises(ImageResizerError, match="invalid or unsupported image"):
+         resize(b"bad", 20, 20)
+ 
+ 
+ def test_dimension_limit():
+-    with pytest.raises(ValueError):
++    with pytest.raises(ImageResizerError, match="dimensions out of range"):
+         resize(sample(), 0, 20)
++
++
++def test_invalid_output_format():
++    with pytest.raises(ImageResizerError, match="output must be"):
++        resize(sample(), 20, 20, "GIF")
++
++
++def test_invalid_quality():
++    with pytest.raises(ImageResizerError, match="quality must be"):
++        resize(sample(), 20, 20, "WEBP", quality=101)
